@@ -1,0 +1,71 @@
+name: build-and-deploy
+
+on:
+  workflow_call:                # lets other repos “call” this workflow
+    inputs:
+      domain_suffix:            # e.g.  apps.12kmedia.com
+        required: true
+        type: string
+      port:                     # internal container port (default 8080)
+        required: false
+        type: string
+        default: '8080'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN_SUFFIX: ${{ inputs.domain_suffix }}
+      APP_PORT:      ${{ inputs.port }}
+
+    steps:
+      # 1 ────────────── pull source
+      - uses: actions/checkout@v4
+
+      # 2 ────────────── buildx + GHCR login
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # 3 ────────────── build & push image
+      - name: Build and push image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      # 4 ────────────── SSH into VPS, (re)start container
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1        # lightweight, no runner needed
+        with:
+          host:      ${{ secrets.SSH_HOST }}
+          username:  root
+          key:       ${{ secrets.SSH_KEY }}
+          script: |
+            set -e
+            APP="$(basename "${GITHUB_REPOSITORY}")"           # repo name
+            DIR="/srv/apps/$APP"
+            IMAGE="${{ env.IMAGE }}"
+            HOSTNAME="$APP.${{ env.DOMAIN_SUFFIX }}"
+            PORT="${{ env.APP_PORT }}"
+
+            mkdir -p "$DIR"
+
+            cat > "$DIR/docker-compose.yml" <<EOF
+            version: '3.9'
+            services:
+              $APP:
+                image: $IMAGE
+                restart: unless-stopped
+                labels:
+                 - traefik.http.routers.$APP.rule=Host(\`$HOSTNAME\`)
+                 - traefik.http.services.$APP.loadbalancer.server.port=$PORT
+            EOF
+
+            docker compose -f "$DIR/docker-compose.yml" pull
+            docker compose -f "$DIR/docker-compose.yml" up -d --remove-orphans
+            docker image prune -f --filter "until=24h"
