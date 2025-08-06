@@ -1,0 +1,83 @@
+name: build-and-deploy
+
+on:
+  workflow_call:
+    inputs:
+      domain_suffix:
+        required: true
+        type: string
+      port:
+        required: false
+        type: string
+        default: '8080'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN_SUFFIX: ${{ inputs.domain_suffix }}
+      APP_PORT:      ${{ inputs.port }}
+
+    steps:
+      # ── 1. checkout ───────────────────────────────────────────────
+      - uses: actions/checkout@v4
+
+      # ── 2. buildx + login ─────────────────────────────────────────
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      # ── 3A. build & push BACKEND image ────────────────────────────
+      - name: Build & push backend
+        run: |
+          BE_IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          docker build -t "$BE_IMAGE" .
+          docker push "$BE_IMAGE"
+          echo "BE_IMAGE=$BE_IMAGE" >> $GITHUB_ENV
+
+      # ── 3B. build & push FRONTEND image ───────────────────────────
+      - name: Build & push frontend
+        run: |
+          FE_IMAGE="ghcr.io/${{ github.repository }}/frontend:latest"
+          docker build -t "$FE_IMAGE" frontend-app
+          docker push "$FE_IMAGE"
+          echo "FE_IMAGE=$FE_IMAGE" >> $GITHUB_ENV
+
+      # ── 4.   SSH to VPS & (re)start containers ────────────────────
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1
+        with:
+          host:      ${{ secrets.SSH_HOST }}
+          username:  root
+          key:       ${{ secrets.SSH_KEY }}
+          script: |
+            set -e
+            APP="$(basename "${GITHUB_REPOSITORY}")"
+            DIR="/srv/apps/$APP"
+
+            mkdir -p "$DIR"
+
+            cat > "$DIR/docker-compose.yml" <<EOF
+            version: '3.9'
+            services:
+              ${APP}-api:
+                image: ${BE_IMAGE}
+                restart: unless-stopped
+                labels:
+                 - traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${DOMAIN_SUFFIX}\`)
+                 - traefik.http.services.${APP}-api.loadbalancer.server.port=${APP_PORT}
+
+              ${APP}-web:
+                image: ${FE_IMAGE}
+                restart: unless-stopped
+                labels:
+                 - traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${DOMAIN_SUFFIX}\`)
+                 - traefik.http.services.${APP}-web.loadbalancer.server.port=80
+            EOF
+
+            docker compose -f "$DIR/docker-compose.yml" pull
+            docker compose -f "$DIR/docker-compose.yml" up -d --remove-orphans
+            docker image prune -f --filter "until=24h"
