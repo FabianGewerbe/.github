@@ -36,7 +36,7 @@ jobs:
           REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           APP_LC=$(basename "$REPO_LC")
           BE_IMAGE="ghcr.io/${REPO_LC}:${{ github.sha }}"
-          docker build -t "$BE_IMAGE" .
+          docker build -t "$BE_IMAGE" backend-api
           docker push "$BE_IMAGE"
           echo "BE_IMAGE=$BE_IMAGE" >> $GITHUB_ENV
           echo "REPO_LC=$REPO_LC"   >> $GITHUB_ENV
