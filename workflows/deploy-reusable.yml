@@ -1,12 +1,12 @@
 name: build-and-deploy
 
 on:
-  workflow_call:                # lets other repos “call” this workflow
+  workflow_call:
     inputs:
-      domain_suffix:            # e.g.  apps.12kmedia.com
+      domain_suffix:
         required: true
         type: string
-      port:                     # internal container port (default 8080)
+      port:
         required: false
         type: string
         default: '8080'
@@ -19,10 +19,10 @@ jobs:
       APP_PORT:      ${{ inputs.port }}
 
     steps:
-      # 1 ────────────── pull source
+      # ── 1. checkout ───────────────────────────────────────────────
       - uses: actions/checkout@v4
 
-      # 2 ────────────── buildx + GHCR login
+      # ── 2. buildx + login ─────────────────────────────────────────
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
@@ -30,40 +30,52 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" |
             docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      # 3 ────────────── build & push image
-      - name: Build and push image
+      # ── 3A. build & push BACKEND image ────────────────────────────
+      - name: Build & push backend
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
-          docker build -t "$IMAGE" .
-          docker push "$IMAGE"
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+          BE_IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          docker build -t "$BE_IMAGE" .
+          docker push "$BE_IMAGE"
+          echo "BE_IMAGE=$BE_IMAGE" >> $GITHUB_ENV
 
-      # 4 ────────────── SSH into VPS, (re)start container
+      # ── 3B. build & push FRONTEND image ───────────────────────────
+      - name: Build & push frontend
+        run: |
+          FE_IMAGE="ghcr.io/${{ github.repository }}/frontend:latest"
+          docker build -t "$FE_IMAGE" frontend-app
+          docker push "$FE_IMAGE"
+          echo "FE_IMAGE=$FE_IMAGE" >> $GITHUB_ENV
+
+      # ── 4.   SSH to VPS & (re)start containers ────────────────────
       - name: Deploy on VPS
-        uses: appleboy/ssh-action@v1        # lightweight, no runner needed
+        uses: appleboy/ssh-action@v1
         with:
           host:      ${{ secrets.SSH_HOST }}
           username:  root
           key:       ${{ secrets.SSH_KEY }}
           script: |
             set -e
-            APP="$(basename "${GITHUB_REPOSITORY}")"           # repo name
+            APP="$(basename "${GITHUB_REPOSITORY}")"
             DIR="/srv/apps/$APP"
-            IMAGE="${{ env.IMAGE }}"
-            HOSTNAME="$APP.${{ env.DOMAIN_SUFFIX }}"
-            PORT="${{ env.APP_PORT }}"
 
             mkdir -p "$DIR"
 
             cat > "$DIR/docker-compose.yml" <<EOF
             version: '3.9'
             services:
-              $APP:
-                image: $IMAGE
+              ${APP}-api:
+                image: ${BE_IMAGE}
                 restart: unless-stopped
                 labels:
-                 - traefik.http.routers.$APP.rule=Host(\`$HOSTNAME\`)
-                 - traefik.http.services.$APP.loadbalancer.server.port=$PORT
+                 - traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${DOMAIN_SUFFIX}\`)
+                 - traefik.http.services.${APP}-api.loadbalancer.server.port=${APP_PORT}
+
+              ${APP}-web:
+                image: ${FE_IMAGE}
+                restart: unless-stopped
+                labels:
+                 - traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${DOMAIN_SUFFIX}\`)
+                 - traefik.http.services.${APP}-web.loadbalancer.server.port=80
             EOF
 
             docker compose -f "$DIR/docker-compose.yml" pull
