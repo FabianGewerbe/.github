@@ -11,6 +11,12 @@ on:
         type: string
         default: '8080'
 
+    secrets:
+      SSH_HOST:
+        required: true
+      SSH_KEY:
+        required: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
