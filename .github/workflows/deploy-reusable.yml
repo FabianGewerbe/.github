@@ -33,15 +33,19 @@ jobs:
       # ── 3A. build & push BACKEND image ────────────────────────────
       - name: Build & push backend
         run: |
-          BE_IMAGE="ghcr.io/${{ github.repository }}:${{ github.sha }}"
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          APP_LC=$(basename "$REPO_LC")
+          BE_IMAGE="ghcr.io/${REPO_LC}:${{ github.sha }}"
           docker build -t "$BE_IMAGE" .
           docker push "$BE_IMAGE"
           echo "BE_IMAGE=$BE_IMAGE" >> $GITHUB_ENV
+          echo "REPO_LC=$REPO_LC"   >> $GITHUB_ENV
+          echo "APP_LC=$APP_LC"     >> $GITHUB_ENV
 
       # ── 3B. build & push FRONTEND image ───────────────────────────
       - name: Build & push frontend
         run: |
-          FE_IMAGE="ghcr.io/${{ github.repository }}/frontend:latest"
+          FE_IMAGE="ghcr.io/${{ env.REPO_LC }}/frontend:latest"
           docker build -t "$FE_IMAGE" frontend-app
           docker push "$FE_IMAGE"
           echo "FE_IMAGE=$FE_IMAGE" >> $GITHUB_ENV
@@ -55,7 +59,7 @@ jobs:
           key:       ${{ secrets.SSH_KEY }}
           script: |
             set -e
-            APP="$(basename "${GITHUB_REPOSITORY}")"
+            APP="${{ env.APP_LC }}"
             DIR="/srv/apps/$APP"
 
             mkdir -p "$DIR"
@@ -64,17 +68,17 @@ jobs:
             version: '3.9'
             services:
               ${APP}-api:
-                image: ${BE_IMAGE}
+                image: ${{ env.BE_IMAGE }}
                 restart: unless-stopped
                 labels:
-                 - traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${DOMAIN_SUFFIX}\`)
-                 - traefik.http.services.${APP}-api.loadbalancer.server.port=${APP_PORT}
+                 - traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${{ env.DOMAIN_SUFFIX }}\`)
+                 - traefik.http.services.${APP}-api.loadbalancer.server.port=${{ env.APP_PORT }}
 
               ${APP}-web:
-                image: ${FE_IMAGE}
+                image: ${{ env.FE_IMAGE }}
                 restart: unless-stopped
                 labels:
-                 - traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${DOMAIN_SUFFIX}\`)
+                 - traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${{ env.DOMAIN_SUFFIX }}\`)
                  - traefik.http.services.${APP}-web.loadbalancer.server.port=80
             EOF
 
