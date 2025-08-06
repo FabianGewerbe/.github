@@ -9,85 +9,242 @@ on:
       port:
         required: false
         type: string
-        default: '8080'
-
+        default: '3001'
+      backend_dir:
+        required: false
+        type: string
+        default: 'backend-api'
+      frontend_dir:
+        required: false
+        type: string
+        default: 'frontend-app'
     secrets:
       SSH_HOST:
         required: true
       SSH_KEY:
         required: true
+      GITHUB_TOKEN:
+        required: true
+      MONGO_CONNECTION_STRING:
+        required: false
+      JWT_SECRET:
+        required: false
+      WEBHOOK_SECRET:
+        required: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+      id-token: write
     env:
       DOMAIN_SUFFIX: ${{ inputs.domain_suffix }}
-      APP_PORT:      ${{ inputs.port }}
+      APP_PORT: ${{ inputs.port }}
+      BACKEND_DIR: ${{ inputs.backend_dir }}
+      FRONTEND_DIR: ${{ inputs.frontend_dir }}
+      REGISTRY: ghcr.io
 
     steps:
-      # ── 1. checkout ───────────────────────────────────────────────
-      - uses: actions/checkout@v4
+      # ── 1. Checkout repository ────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # ── 2. buildx + login ─────────────────────────────────────────
-      - uses: docker/setup-buildx-action@v3
+      # ── 2. Set up Docker Buildx ───────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" |
-            docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      # ── 3A. build & push BACKEND image ────────────────────────────
-      - name: Build & push backend
-        run: |
-          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          APP_LC=$(basename "$REPO_LC")
-          BE_IMAGE="ghcr.io/${REPO_LC}:${{ github.sha }}"
-          docker build -t "$BE_IMAGE" backend-api
-          docker push "$BE_IMAGE"
-          echo "BE_IMAGE=$BE_IMAGE" >> $GITHUB_ENV
-          echo "REPO_LC=$REPO_LC"   >> $GITHUB_ENV
-          echo "APP_LC=$APP_LC"     >> $GITHUB_ENV
-
-      # ── 3B. build & push FRONTEND image ───────────────────────────
-      - name: Build & push frontend
-        run: |
-          FE_IMAGE="ghcr.io/${{ env.REPO_LC }}/frontend:latest"
-          docker build -t "$FE_IMAGE" frontend-app
-          docker push "$FE_IMAGE"
-          echo "FE_IMAGE=$FE_IMAGE" >> $GITHUB_ENV
-
-      # ── 4.   SSH to VPS & (re)start containers ────────────────────
-      - name: Deploy on VPS
-        uses: appleboy/ssh-action@v1
+      # ── 3. Log in to GitHub Container Registry ────────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          host:      ${{ secrets.SSH_HOST }}
-          username:  root
-          key:       ${{ secrets.SSH_KEY }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Prepare variables (lowercase, app name, etc) ───────────
+      - name: Prepare variables
+        id: vars
+        run: |
+          # Convert repository name to lowercase (GHCR requirement)
+          REPO_LC=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          
+          # Extract app name from repository name
+          APP_LC=$(basename "$REPO_LC" | tr '_' '-')
+          
+          # Output variables for use in other steps
+          echo "repo_lc=$REPO_LC" >> $GITHUB_OUTPUT
+          echo "app_lc=$APP_LC" >> $GITHUB_OUTPUT
+          
+          # Also set as env vars for this job
+          echo "REPO_LC=$REPO_LC" >> $GITHUB_ENV
+          echo "APP_LC=$APP_LC" >> $GITHUB_ENV
+          
+          # Log for debugging
+          echo "Repository (lowercase): $REPO_LC"
+          echo "App name: $APP_LC"
+          echo "Backend dir: ${{ env.BACKEND_DIR }}"
+          echo "Frontend dir: ${{ env.FRONTEND_DIR }}"
+
+      # ── 5. Check if directories exist ─────────────────────────────
+      - name: Check project structure
+        id: check
+        run: |
+          # Check if backend directory exists
+          if [ -d "${{ env.BACKEND_DIR }}" ]; then
+            echo "has_backend=true" >> $GITHUB_OUTPUT
+            echo "✅ Backend directory found: ${{ env.BACKEND_DIR }}"
+          else
+            echo "has_backend=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No backend directory at: ${{ env.BACKEND_DIR }}"
+          fi
+          
+          # Check if frontend directory exists
+          if [ -d "${{ env.FRONTEND_DIR }}" ]; then
+            echo "has_frontend=true" >> $GITHUB_OUTPUT
+            echo "✅ Frontend directory found: ${{ env.FRONTEND_DIR }}"
+          else
+            echo "has_frontend=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No frontend directory at: ${{ env.FRONTEND_DIR }}"
+          fi
+
+      # ── 6A. Build & push BACKEND image (if exists) ────────────────
+      - name: Build and push backend
+        if: steps.check.outputs.has_backend == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ env.BACKEND_DIR }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}/backend:latest
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 6B. Build & push FRONTEND image (if exists) ───────────────
+      - name: Build and push frontend
+        if: steps.check.outputs.has_frontend == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./${{ env.FRONTEND_DIR }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}/frontend:latest
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}/frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── 7. Deploy to VPS via SSH ──────────────────────────────────
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: root
+          key: ${{ secrets.SSH_KEY }}
           script: |
             set -e
-            APP="${{ env.APP_LC }}"
+            
+            # Variables from GitHub Actions
+            APP="${{ steps.vars.outputs.app_lc }}"
+            REPO_LC="${{ steps.vars.outputs.repo_lc }}"
             DIR="/srv/apps/$APP"
-
+            BACKEND_IMAGE="${{ env.REGISTRY }}/${REPO_LC}/backend:${{ github.sha }}"
+            FRONTEND_IMAGE="${{ env.REGISTRY }}/${REPO_LC}/frontend:${{ github.sha }}"
+            HAS_BACKEND="${{ steps.check.outputs.has_backend }}"
+            HAS_FRONTEND="${{ steps.check.outputs.has_frontend }}"
+            
+            echo "🚀 Deploying $APP to $DIR"
+            echo "   Backend: $HAS_BACKEND"
+            echo "   Frontend: $HAS_FRONTEND"
+            
+            # Create app directory
             mkdir -p "$DIR"
-
-            cat > "$DIR/docker-compose.yml" <<EOF
+            cd "$DIR"
+            
+            # Start building docker-compose.yml
+            cat > docker-compose.yml <<'COMPOSE_START'
             version: '3.9'
+            
+            networks:
+              stack_default:
+                external: true
+            
             services:
+            COMPOSE_START
+            
+            # Add backend service if it exists
+            if [ "$HAS_BACKEND" = "true" ]; then
+              cat >> docker-compose.yml <<EOF
               ${APP}-api:
-                image: ${{ env.BE_IMAGE }}
+                image: ${BACKEND_IMAGE}
                 restart: unless-stopped
+                networks:
+                  - stack_default
+                environment:
+                  - NODE_ENV=production
+                  - PORT=${{ env.APP_PORT }}
+                  - MONGO_CONNECTION_STRING=${{ secrets.MONGO_CONNECTION_STRING }}
+                  - JWT_SECRET=${{ secrets.JWT_SECRET }}
+                  - WEBHOOK_SECRET=${{ secrets.WEBHOOK_SECRET }}
+                  - MAX_MATCH_RADIUS_METERS=500
+                  - DEFAULT_LEAD_SCORE=50
+                  - GEOCODING_DELAY_MS=1100
                 labels:
-                 - traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${{ env.DOMAIN_SUFFIX }}\`)
-                 - traefik.http.services.${APP}-api.loadbalancer.server.port=${{ env.APP_PORT }}
-
-              ${APP}-web:
-                image: ${{ env.FE_IMAGE }}
-                restart: unless-stopped
-                labels:
-                 - traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${{ env.DOMAIN_SUFFIX }}\`)
-                 - traefik.http.services.${APP}-web.loadbalancer.server.port=80
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=stack_default"
+                  - "traefik.http.routers.${APP}-api.rule=Host(\`${APP}-api.${{ env.DOMAIN_SUFFIX }}\`)"
+                  - "traefik.http.services.${APP}-api.loadbalancer.server.port=${{ env.APP_PORT }}"
+                  - "traefik.http.routers.${APP}-api.entrypoints=websecure,web"
+                  - "traefik.http.routers.${APP}-api.tls=true"
+                  - "traefik.http.routers.${APP}-api.tls.certresolver=letsencrypt"
             EOF
-
-            docker compose -f "$DIR/docker-compose.yml" pull
-            docker compose -f "$DIR/docker-compose.yml" up -d --remove-orphans
+            fi
+            
+            # Add frontend service if it exists
+            if [ "$HAS_FRONTEND" = "true" ]; then
+              # Add newline if backend exists
+              [ "$HAS_BACKEND" = "true" ] && echo "" >> docker-compose.yml
+              
+              cat >> docker-compose.yml <<EOF
+              ${APP}-web:
+                image: ${FRONTEND_IMAGE}
+                restart: unless-stopped
+                networks:
+                  - stack_default
+                environment:
+                  - VITE_API_BASE_URL=https://${APP}-api.${{ env.DOMAIN_SUFFIX }}
+                  - REACT_APP_API_URL=https://${APP}-api.${{ env.DOMAIN_SUFFIX }}
+                labels:
+                  - "traefik.enable=true"
+                  - "traefik.docker.network=stack_default"
+                  - "traefik.http.routers.${APP}-web.rule=Host(\`${APP}-web.${{ env.DOMAIN_SUFFIX }}\`)"
+                  - "traefik.http.services.${APP}-web.loadbalancer.server.port=80"
+                  - "traefik.http.routers.${APP}-web.entrypoints=websecure,web"
+                  - "traefik.http.routers.${APP}-web.tls=true"
+                  - "traefik.http.routers.${APP}-web.tls.certresolver=letsencrypt"
+            EOF
+            fi
+            
+            # Login to GitHub Container Registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Pull and deploy
+            echo "📦 Pulling images..."
+            docker compose pull
+            
+            echo "🔄 Restarting containers..."
+            docker compose up -d --remove-orphans
+            
+            # Show status
+            echo "✅ Deployment complete!"
+            docker compose ps
+            
+            # Cleanup old images
+            echo "🧹 Cleaning up old images..."
             docker image prune -f --filter "until=24h"
+            
+            echo "🎉 Successfully deployed $APP!"
+            echo "   Frontend: https://${APP}-web.${{ env.DOMAIN_SUFFIX }}"
+            echo "   Backend: https://${APP}-api.${{ env.DOMAIN_SUFFIX }}"
